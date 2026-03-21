@@ -334,7 +334,7 @@ impl Instance {
 
         clients
             .get_mut(&client_id)
-            .expect("no matching client")
+            .context("no matching client")?
             .files
             .insert(uri.clone());
 
@@ -556,28 +556,43 @@ async fn gc_task(
 /// The instance is looked up based on `instance_key`. If an existing one is
 /// found then it's returned and `init_req_params` are discarded. If it's
 /// not found a new instance is spawned and initialized using the provided
-/// `init_req_params`, this insance is then inserted into the map and returned.
+/// `init_req_params`, this instance is then inserted into the map and returned.
 pub async fn get_or_spawn(
     map: Arc<Mutex<InstanceMap>>,
     key: InstanceKey,
     init_req_params: lsp::InitializeParams,
     client: Client,
 ) -> Result<Arc<Instance>> {
-    // We have locked a clone of an Arc of the map, we can assume noone else
-    // tries to spawn the same instance again. But we have to make sure `spawn`
-    // doesn't try to lock its copy as well. This is a bit unfortunate code
-    // organization but we want to have spawn in a separate tracing context and
-    // we want to include `wait_task` in it as well in it as well
-    match map.clone().lock().await.0.entry(key.clone()) {
-        Entry::Occupied(e) => {
+    // Fast path: reuse an existing instance without blocking on spawn.
+    {
+        let map_guard = map.lock().await;
+        if let Some(instance) = map_guard.0.get(&key) {
             info!("reusing language server instance");
-            e.get().add_client(client).await;
-            Ok(e.get().clone())
+            let instance = instance.clone();
+            drop(map_guard);
+            instance.add_client(client).await;
+            return Ok(instance);
+        }
+    }
+
+    // Slow path: spawn a new instance without holding the map lock.
+    // Clone the client so we can re-register it if we lose a spawn race.
+    let instance = spawn(key.clone(), init_req_params, map.clone(), client.clone())
+        .await
+        .context("spawning instance")?;
+
+    // Re-acquire the lock and insert, handling the rare case where another
+    // task spawned an instance for the same key while we were blocked.
+    let mut map_guard = map.lock().await;
+    match map_guard.0.entry(key) {
+        Entry::Occupied(e) => {
+            let winner = e.get().clone();
+            drop(map_guard);
+            instance.close.notify_one();
+            winner.add_client(client).await;
+            Ok(winner)
         }
         Entry::Vacant(e) => {
-            let instance = spawn(key, init_req_params, map, client)
-                .await
-                .context("spawning instance")?;
             e.insert(instance.clone());
             Ok(instance)
         }
@@ -588,9 +603,8 @@ pub async fn get_or_spawn(
 async fn spawn(
     key: InstanceKey,
     mut init_req_params: lsp::InitializeParams,
-    // Caller `get_or_spawn` is holding a lock to the map, we must not try to
-    // lock it within this function to not cause deadlock, only spawned tasks
-    // are allowed to lock it again.
+    // NOTE: The caller may not be holding the instance map lock. Spawned
+    // tasks (e.g. wait_task) may lock the map independently.
     map: Arc<Mutex<InstanceMap>>,
     client: Client,
 ) -> Result<Arc<Instance>> {
@@ -707,14 +721,6 @@ async fn initialize_handshake(
     //
     // [1]: https://microsoft.github.io/language-server-protocol/specifications/lsp/3.17/specification/#initialize
     //
-    // FIXME: The larger problem with this approach is that some servers (e.g.
-    // `kotlin-language-server`) do not respond with an initialize response
-    // immediately, but block until they've indexed the whole project. And
-    // we hold the `InstanceMap` lock _the whole time_ this loop is waiting,
-    // the lock held in `instance::get_or_spawn` -> `instance::spawn` ->
-    // `instance::initialize_handshake` which blocks _any_ connection to the
-    // lspmux client, as all the functions called from `client::process` sooner
-    // or later need to lock the `InstanceMap` as well.
     let res = loop {
         match reader
             .read_message()
@@ -810,8 +816,15 @@ async fn wait_task(
                 }
             }
             exit = child.wait() => {
-                // Remove the closing instance from the map so new clients spawn their own instance
-                instance_map.lock().await.0.remove(&key);
+                // Remove ourselves from the map so new clients spawn their own
+                // instance. Guard with ptr_eq to avoid removing a different
+                // instance that may have replaced us after a spawn race.
+                {
+                    let mut map = instance_map.lock().await;
+                    if map.0.get(&key).is_some_and(|i| Arc::ptr_eq(i, &instance)) {
+                        map.0.remove(&key);
+                    }
+                }
 
                 // Disconnect all current clients
                 //
