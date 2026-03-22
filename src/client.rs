@@ -243,12 +243,7 @@ async fn connect(
         .context("get workspace_root metadata")?;
 
     // Get an language server instance for this client.
-    let key = InstanceKey {
-        server,
-        args,
-        env,
-        workspace_root,
-    };
+    let key = InstanceKey::new(server, args, env, workspace_root);
     let (client, client_rx) = Client::new(client_id);
     let instance = instance::get_or_spawn(instance_map, key, init_params, client.clone()).await?;
 

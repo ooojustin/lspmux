@@ -29,12 +29,51 @@ use crate::lsp::{self, ext};
 /// Specifies server configuration
 ///
 /// If another server with the same configuration is requested we can reuse it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug)]
 pub struct InstanceKey {
     pub server: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    match_env: BTreeMap<String, String>,
     pub workspace_root: WorkspaceRoot,
+}
+
+impl InstanceKey {
+    pub fn new(
+        server: String,
+        args: Vec<String>,
+        env: BTreeMap<String, String>,
+        workspace_root: WorkspaceRoot,
+    ) -> Self {
+        let match_env = normalize_instance_env(&env);
+        Self {
+            server,
+            args,
+            env,
+            match_env,
+            workspace_root,
+        }
+    }
+}
+
+impl PartialEq for InstanceKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.server == other.server
+            && self.args == other.args
+            && self.match_env == other.match_env
+            && self.workspace_root == other.workspace_root
+    }
+}
+
+impl Eq for InstanceKey {}
+
+impl Hash for InstanceKey {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.server.hash(state);
+        self.args.hash(state);
+        self.match_env.hash(state);
+        self.workspace_root.hash(state);
+    }
 }
 
 /// Represents workspace root as a unique directory
@@ -173,6 +212,34 @@ impl Deref for ClientData {
 fn elapsed_seconds() -> i64 {
     static START: LazyLock<Instant> = LazyLock::new(Instant::now);
     START.elapsed().as_secs() as i64
+}
+
+fn normalize_instance_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    env.iter()
+        .filter(|(key, _)| !is_volatile_instance_env_key(key))
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
+}
+
+fn is_volatile_instance_env_key(key: &str) -> bool {
+    matches!(
+        key,
+        "PWD"
+            | "OLDPWD"
+            | "SHLVL"
+            | "_"
+            | "TERM"
+            | "COLORTERM"
+            | "WINDOWID"
+            | "WINDOWPATH"
+            | "WERKZEUG_SERVER_FD"
+    ) || key.starts_with("ALACRITTY_")
+        || key.starts_with("ZELLIJ")
+        || key.starts_with("TMUX")
+        || key == "NVIM"
+        || key.starts_with("NVIM_")
+        || key == "VIM"
+        || key == "VIMRUNTIME"
 }
 
 impl Instance {
@@ -622,6 +689,7 @@ async fn spawn(
                 args,
                 env,
                 workspace_root,
+                ..
             } = &key;
             let path = env
                 .get("PATH")
@@ -688,6 +756,67 @@ async fn spawn(
     task::spawn(wait_task(instance.clone(), map, child).in_current_span());
 
     Ok(instance)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{InstanceKey, WorkspaceRoot};
+    use std::collections::BTreeMap;
+
+    fn workspace_root() -> WorkspaceRoot {
+        WorkspaceRoot {
+            path: "/tmp/workspace".into(),
+            device_id: 1,
+            file_id: 2,
+        }
+    }
+
+    #[test]
+    fn instance_key_ignores_volatile_environment_values() {
+        let mut env_a = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("PWD".to_string(), "/tmp/workspace".to_string()),
+            ("WERKZEUG_SERVER_FD".to_string(), "10".to_string()),
+        ]);
+        let mut env_b = env_a.clone();
+        env_b.insert("PWD".to_string(), "/tmp/workspace/src".to_string());
+        env_b.insert("WERKZEUG_SERVER_FD".to_string(), "11".to_string());
+
+        let key_a = InstanceKey::new(
+            "rust-analyzer".into(),
+            vec![],
+            env_a.clone(),
+            workspace_root(),
+        );
+        let key_b = InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root());
+
+        assert_eq!(key_a, key_b);
+
+        env_a.insert("PATH".to_string(), "/usr/bin".to_string());
+        let key_c = InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root());
+        assert_ne!(key_a, key_c);
+    }
+
+    #[test]
+    fn instance_key_ignores_terminal_specific_environment_values() {
+        let env_a = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("ALACRITTY_WINDOW_ID".to_string(), "1".to_string()),
+            ("ZELLIJ".to_string(), "0".to_string()),
+            ("TMUX".to_string(), "tmux-1".to_string()),
+        ]);
+        let env_b = BTreeMap::from([
+            ("PATH".to_string(), "/bin".to_string()),
+            ("ALACRITTY_WINDOW_ID".to_string(), "2".to_string()),
+            ("ZELLIJ".to_string(), "1".to_string()),
+            ("TMUX".to_string(), "tmux-2".to_string()),
+        ]);
+
+        let key_a = InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root());
+        let key_b = InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root());
+
+        assert_eq!(key_a, key_b);
+    }
 }
 
 #[instrument(skip_all)]
