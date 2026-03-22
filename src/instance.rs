@@ -145,6 +145,17 @@ impl fmt::Debug for WorkspaceRoot {
     }
 }
 
+/// Notification methods that represent current server state rather than one-off
+/// events. The latest notification for each of these methods is cached and
+/// replayed to newly connecting clients.
+///
+/// `experimental/serverStatus` is used by rust-analyzer (and others) to
+/// advertise readiness (`quiescent: true`). Without replay, clients that
+/// connect after the server is already warm never learn it's ready.
+fn is_stateful_notification(method: &str) -> bool {
+    matches!(method, "experimental/serverStatus")
+}
+
 /// Language server instance
 pub struct Instance {
     key: InstanceKey,
@@ -163,6 +174,13 @@ pub struct Instance {
 
     /// Dynamic capabilities registered by the server
     dynamic_capabilities: Mutex<HashMap<String, lsp::Registration>>,
+
+    /// Stateful server notifications cached for replay to new clients.
+    ///
+    /// Only the most recent notification per method is kept, matching the
+    /// "last value wins" semantics of state notifications like
+    /// `experimental/serverStatus`.
+    cached_notifications: Mutex<HashMap<String, Notification>>,
 
     /// Wakes up `wait_task` and asks it to send SIGKILL to the instance.
     close: Notify,
@@ -263,18 +281,21 @@ impl Instance {
 
     /// Add client to the instance so it can receive traffic from it
     ///
-    /// It replays all registered dynamic capabilities to it.
+    /// Replays dynamic capabilities and cached state notifications so the new
+    /// client starts with the same view of the server as existing clients.
     pub async fn add_client(&self, client: Client) {
-        // NOTE: this method holds both `clients` and `dynamic_capabilities`
-        // locks across a `send_message` await. This is acceptable because the
-        // client channel is freshly created and no receiver task has been
-        // spawned yet, so the send completes immediately without yielding.
+        // NOTE: this method holds `clients`, `dynamic_capabilities`, and
+        // `cached_notifications` locks across `send_message` awaits. This is
+        // acceptable because the client channel is freshly created and no
+        // receiver task has been spawned yet, so sends complete immediately
+        // without yielding.
         //
         // If `add_client` is ever called with an active client whose channel
         // might be full, this must be restructured to snapshot and release the
         // locks first.
         let mut clients = self.clients.lock().await;
         let dyn_capabilities = self.dynamic_capabilities.lock().await;
+        let cached_notifs = self.cached_notifications.lock().await;
 
         if !dyn_capabilities.is_empty() {
             // Register all currently cached dynamic capabilities if there are
@@ -292,6 +313,11 @@ impl Instance {
             };
             debug!(?req, "replaying server request");
             let _ = client.send_message(req.into()).await;
+        }
+
+        for notif in cached_notifs.values() {
+            debug!(method = %notif.method, "replaying cached notification");
+            let _ = client.send_message(notif.clone().into()).await;
         }
 
         let client = ClientData {
@@ -368,6 +394,14 @@ impl Instance {
         }
 
         Ok(())
+    }
+
+    /// Cache a stateful notification for replay to new clients
+    async fn cache_notification(&self, notif: Notification) {
+        self.cached_notifications
+            .lock()
+            .await
+            .insert(notif.method.clone(), notif);
     }
 
     /// Remove cached capability registration to stop replaying them to new clients
@@ -747,6 +781,7 @@ async fn spawn(
         server: message_writer,
         clients: Mutex::new(clients),
         dynamic_capabilities: Mutex::default(),
+        cached_notifications: Mutex::default(),
         close: Notify::new(),
         last_used: AtomicI64::new(elapsed_seconds()),
     });
@@ -1155,6 +1190,14 @@ async fn stdout_task(instance: Arc<Instance>, mut reader: LspReader<BufReader<Ch
             }
 
             Message::Notification(notif) => {
+                // Cache stateful notifications before broadcasting so that a
+                // client connecting between the cache update and the broadcast
+                // receives the state via add_client's replay (duplicate at
+                // worst, which is benign).
+                if is_stateful_notification(&notif.method) {
+                    instance.cache_notification(notif.clone()).await;
+                }
+
                 // Server notifications don't expect a response. We can forward
                 // them to all clients.
                 for client in instance.clients().await {
