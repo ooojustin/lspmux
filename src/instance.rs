@@ -224,7 +224,8 @@ fn normalize_instance_env(env: &BTreeMap<String, String>) -> BTreeMap<String, St
 fn is_volatile_instance_env_key(key: &str) -> bool {
     matches!(
         key,
-        "PWD"
+        "PATH"
+            | "PWD"
             | "OLDPWD"
             | "SHLVL"
             | "_"
@@ -777,8 +778,10 @@ mod tests {
             ("PATH".to_string(), "/bin".to_string()),
             ("PWD".to_string(), "/tmp/workspace".to_string()),
             ("WERKZEUG_SERVER_FD".to_string(), "10".to_string()),
+            ("OPENAI_API_KEY".to_string(), "a".to_string()),
         ]);
         let mut env_b = env_a.clone();
+        env_b.insert("PATH".to_string(), "/usr/bin".to_string());
         env_b.insert("PWD".to_string(), "/tmp/workspace/src".to_string());
         env_b.insert("WERKZEUG_SERVER_FD".to_string(), "11".to_string());
 
@@ -792,7 +795,7 @@ mod tests {
 
         assert_eq!(key_a, key_b);
 
-        env_a.insert("PATH".to_string(), "/usr/bin".to_string());
+        env_a.insert("OPENAI_API_KEY".to_string(), "b".to_string());
         let key_c = InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root());
         assert_ne!(key_a, key_c);
     }
