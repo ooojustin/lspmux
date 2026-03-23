@@ -242,8 +242,9 @@ async fn connect(
         .expect("blocking task panicked")
         .context("get workspace_root metadata")?;
 
-    // Get an language server instance for this client.
-    let key = InstanceKey::new(server, args, env, workspace_root);
+    // Get a language server instance for this client.
+    let match_filters = instance_map.lock().await.match_environment();
+    let key = InstanceKey::new(server, args, env, workspace_root, &match_filters);
     let (client, client_rx) = Client::new(client_id);
     let instance = instance::get_or_spawn(instance_map, key, init_params, client.clone()).await?;
 

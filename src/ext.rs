@@ -106,6 +106,20 @@ pub async fn status(config: &Config, json: bool, verbose: bool) -> Result<()> {
                 println!("");
             }
         }
+        if !instance.match_env.is_empty() {
+            if verbose {
+                println!("  match_env:");
+                for (key, val) in &instance.match_env {
+                    println!("    {key} = {val}");
+                }
+            } else {
+                print!("  match_env:");
+                for key in instance.match_env.keys() {
+                    print!(" {key}");
+                }
+                println!();
+            }
+        }
         println!("  last used: {}s ago", instance.idle_for);
         if verbose {
             println!("  registered dynamic capabilities:");

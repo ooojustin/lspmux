@@ -20,7 +20,7 @@ use tokio::{select, task};
 use tracing::{debug, error, field, info, instrument, trace, warn, Instrument};
 
 use crate::client::Client;
-use crate::config::Config;
+use crate::config::{Config, Filter};
 use crate::lsp::ext::Tag;
 use crate::lsp::jsonrpc::{Message, Notification, Request, RequestId, ResponseSuccess, Version};
 use crate::lsp::transport::{LspReader, LspWriter};
@@ -44,8 +44,9 @@ impl InstanceKey {
         args: Vec<String>,
         env: BTreeMap<String, String>,
         workspace_root: WorkspaceRoot,
+        match_filters: &[Filter],
     ) -> Self {
-        let match_env = normalize_instance_env(&env);
+        let match_env = build_match_env(&env, match_filters);
         Self {
             server,
             args,
@@ -53,6 +54,10 @@ impl InstanceKey {
             match_env,
             workspace_root,
         }
+    }
+
+    pub fn match_env(&self) -> &BTreeMap<String, String> {
+        &self.match_env
     }
 }
 
@@ -232,33 +237,24 @@ fn elapsed_seconds() -> i64 {
     START.elapsed().as_secs() as i64
 }
 
-fn normalize_instance_env(env: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    env.iter()
-        .filter(|(key, _)| !is_volatile_instance_env_key(key))
-        .map(|(key, value)| (key.clone(), value.clone()))
-        .collect()
-}
+fn build_match_env(
+    env: &BTreeMap<String, String>,
+    filters: &[Filter],
+) -> BTreeMap<String, String> {
+    if filters.is_empty() {
+        return BTreeMap::new();
+    }
 
-fn is_volatile_instance_env_key(key: &str) -> bool {
-    matches!(
-        key,
-        "PATH"
-            | "PWD"
-            | "OLDPWD"
-            | "SHLVL"
-            | "_"
-            | "TERM"
-            | "COLORTERM"
-            | "WINDOWID"
-            | "WINDOWPATH"
-            | "WERKZEUG_SERVER_FD"
-    ) || key.starts_with("ALACRITTY_")
-        || key.starts_with("ZELLIJ")
-        || key.starts_with("TMUX")
-        || key == "NVIM"
-        || key.starts_with("NVIM_")
-        || key == "VIM"
-        || key == "VIMRUNTIME"
+    let positive: Vec<_> = filters.iter().filter(|f| !f.negative).collect();
+    let negative: Vec<_> = filters.iter().filter(|f| f.negative).collect();
+
+    env.iter()
+        .filter(|(key, _)| {
+            positive.iter().any(|f| f.pattern.matches(key))
+                && !negative.iter().any(|f| f.pattern.matches(key))
+        })
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect()
 }
 
 impl Instance {
@@ -527,6 +523,7 @@ impl Instance {
             server: self.key.server.clone(),
             args: self.key.args.clone(),
             env: self.key.env.clone(),
+            match_env: self.key.match_env().clone(),
             workspace_root: ext::WorkspaceRoot {
                 path: self.key.workspace_root.path.clone(),
                 device_id: self.key.workspace_root.device_id,
@@ -587,11 +584,17 @@ impl Instance {
     }
 }
 
-pub struct InstanceMap(HashMap<InstanceKey, Arc<Instance>>);
+pub struct InstanceMap {
+    instances: HashMap<InstanceKey, Arc<Instance>>,
+    match_environment: Arc<Vec<Filter>>,
+}
 
 impl InstanceMap {
     pub fn new(config: &Config) -> Arc<Mutex<Self>> {
-        let instance_map = Arc::new(Mutex::new(InstanceMap(HashMap::new())));
+        let instance_map = Arc::new(Mutex::new(InstanceMap {
+            instances: HashMap::new(),
+            match_environment: Arc::new(config.match_environment.clone()),
+        }));
         task::spawn(gc_task(
             instance_map.clone(),
             config.gc_interval,
@@ -600,12 +603,16 @@ impl InstanceMap {
         instance_map
     }
 
+    pub fn match_environment(&self) -> Arc<Vec<Filter>> {
+        self.match_environment.clone()
+    }
+
     /// Finds an instance with the longest path such as
     /// `cwd.starts_with(workspace_root)` is true.
     ///
     /// This returns owned data to allow callers to drop the lock immediately.
     pub fn get_by_cwd(&self, cwd: &str) -> Option<Arc<Instance>> {
-        self.0
+        self.instances
             .iter()
             .filter(|(key, _)| Path::new(cwd).starts_with(&key.workspace_root.path))
             .max_by_key(|(key, _)| key.workspace_root.path.len())
@@ -616,7 +623,7 @@ impl InstanceMap {
     ///
     /// This returns owned data to allow callers to drop the lock immediately.
     pub fn instances(&self) -> Vec<Arc<Instance>> {
-        self.0.values().cloned().collect()
+        self.instances.values().cloned().collect()
     }
 }
 
@@ -668,7 +675,7 @@ pub async fn get_or_spawn(
     // Fast path: reuse an existing instance without blocking on spawn.
     {
         let map_guard = map.lock().await;
-        if let Some(instance) = map_guard.0.get(&key) {
+        if let Some(instance) = map_guard.instances.get(&key) {
             info!("reusing language server instance");
             let instance = instance.clone();
             drop(map_guard);
@@ -686,7 +693,7 @@ pub async fn get_or_spawn(
     // Re-acquire the lock and insert, handling the rare case where another
     // task spawned an instance for the same key while we were blocked.
     let mut map_guard = map.lock().await;
-    match map_guard.0.entry(key) {
+    match map_guard.instances.entry(key) {
         Entry::Occupied(e) => {
             let winner = e.get().clone();
             drop(map_guard);
@@ -797,6 +804,8 @@ async fn spawn(
 #[cfg(test)]
 mod tests {
     use super::{InstanceKey, WorkspaceRoot};
+    use crate::config::Filter;
+    use glob::Pattern;
     use std::collections::BTreeMap;
 
     fn workspace_root() -> WorkspaceRoot {
@@ -808,52 +817,100 @@ mod tests {
     }
 
     #[test]
-    fn instance_key_ignores_volatile_environment_values() {
-        let mut env_a = BTreeMap::from([
+    fn instance_key_ignores_all_env_with_empty_match_filters() {
+        let env_a = BTreeMap::from([
             ("PATH".to_string(), "/bin".to_string()),
-            ("PWD".to_string(), "/tmp/workspace".to_string()),
-            ("WERKZEUG_SERVER_FD".to_string(), "10".to_string()),
-            ("OPENAI_API_KEY".to_string(), "a".to_string()),
+            ("OPENAI_API_KEY".to_string(), "key-a".to_string()),
+            ("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),
         ]);
-        let mut env_b = env_a.clone();
-        env_b.insert("PATH".to_string(), "/usr/bin".to_string());
-        env_b.insert("PWD".to_string(), "/tmp/workspace/src".to_string());
-        env_b.insert("WERKZEUG_SERVER_FD".to_string(), "11".to_string());
+        let env_b = BTreeMap::from([
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("OPENAI_API_KEY".to_string(), "key-b".to_string()),
+            ("RUSTUP_TOOLCHAIN".to_string(), "stable".to_string()),
+        ]);
+
+        let filters: Vec<Filter> = vec![];
+        let key_a =
+            InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root(), &filters);
+        let key_b =
+            InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root(), &filters);
+
+        assert_eq!(key_a, key_b);
+    }
+
+    #[test]
+    fn instance_key_matches_only_specified_env_vars() {
+        let env_a = BTreeMap::from([
+            ("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),
+            ("PATH".to_string(), "/bin".to_string()),
+            ("NVIM".to_string(), "1".to_string()),
+        ]);
+        let env_b = BTreeMap::from([
+            ("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),
+            ("PATH".to_string(), "/usr/bin".to_string()),
+            ("NVIM".to_string(), "2".to_string()),
+        ]);
+
+        let filters = vec![Filter {
+            negative: false,
+            pattern: Pattern::new("RUSTUP_TOOLCHAIN").unwrap(),
+        }];
 
         let key_a = InstanceKey::new(
             "rust-analyzer".into(),
             vec![],
             env_a.clone(),
             workspace_root(),
+            &filters,
         );
-        let key_b = InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root());
+        let key_b =
+            InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root(), &filters);
 
+        // PATH and NVIM differ but aren't in match_environment
         assert_eq!(key_a, key_b);
 
-        env_a.insert("OPENAI_API_KEY".to_string(), "b".to_string());
-        let key_c = InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root());
+        // Different RUSTUP_TOOLCHAIN -> different keys
+        let mut env_c = env_a;
+        env_c.insert("RUSTUP_TOOLCHAIN".to_string(), "stable".to_string());
+        let key_c =
+            InstanceKey::new("rust-analyzer".into(), vec![], env_c, workspace_root(), &filters);
         assert_ne!(key_a, key_c);
     }
 
     #[test]
-    fn instance_key_ignores_terminal_specific_environment_values() {
-        let env_a = BTreeMap::from([
-            ("PATH".to_string(), "/bin".to_string()),
-            ("ALACRITTY_WINDOW_ID".to_string(), "1".to_string()),
-            ("ZELLIJ".to_string(), "0".to_string()),
-            ("TMUX".to_string(), "tmux-1".to_string()),
-        ]);
-        let env_b = BTreeMap::from([
-            ("PATH".to_string(), "/bin".to_string()),
-            ("ALACRITTY_WINDOW_ID".to_string(), "2".to_string()),
-            ("ZELLIJ".to_string(), "1".to_string()),
-            ("TMUX".to_string(), "tmux-2".to_string()),
+    fn instance_key_match_env_supports_negative_filters() {
+        let env = BTreeMap::from([
+            ("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),
+            ("RUSTUP_HOME".to_string(), "/home/user/.rustup".to_string()),
+            (
+                "CARGO_TARGET_DIR".to_string(),
+                "/tmp/target".to_string(),
+            ),
         ]);
 
-        let key_a = InstanceKey::new("rust-analyzer".into(), vec![], env_a, workspace_root());
-        let key_b = InstanceKey::new("rust-analyzer".into(), vec![], env_b, workspace_root());
+        let filters = vec![
+            Filter {
+                negative: false,
+                pattern: Pattern::new("RUST*").unwrap(),
+            },
+            Filter {
+                negative: true,
+                pattern: Pattern::new("RUSTUP_HOME").unwrap(),
+            },
+        ];
 
-        assert_eq!(key_a, key_b);
+        let key = InstanceKey::new(
+            "rust-analyzer".into(),
+            vec![],
+            env,
+            workspace_root(),
+            &filters,
+        );
+
+        assert_eq!(
+            key.match_env(),
+            &BTreeMap::from([("RUSTUP_TOOLCHAIN".to_string(), "nightly".to_string()),])
+        );
     }
 }
 
@@ -988,8 +1045,8 @@ async fn wait_task(
                 // instance that may have replaced us after a spawn race.
                 {
                     let mut map = instance_map.lock().await;
-                    if map.0.get(&key).is_some_and(|i| Arc::ptr_eq(i, &instance)) {
-                        map.0.remove(&key);
+                    if map.instances.get(&key).is_some_and(|i| Arc::ptr_eq(i, &instance)) {
+                        map.instances.remove(&key);
                     }
                 }
 

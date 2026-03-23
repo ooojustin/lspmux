@@ -43,6 +43,10 @@ mod default {
             pattern: Pattern::new("*").unwrap(),
         }]
     }
+
+    pub fn match_environment() -> Vec<Filter> {
+        vec![]
+    }
 }
 
 mod de {
@@ -87,7 +91,7 @@ mod de {
         }
     }
 
-    pub fn pass_environment<'de, D>(deserializer: D) -> Result<Vec<Filter>, D::Error>
+    fn filter_list<'de, D>(deserializer: D) -> Result<Vec<Filter>, D::Error>
     where
         D: Deserializer<'de>,
     {
@@ -106,12 +110,26 @@ mod de {
             })
             .collect()
     }
+
+    pub fn pass_environment<'de, D>(deserializer: D) -> Result<Vec<Filter>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        filter_list(deserializer)
+    }
+
+    pub fn match_environment<'de, D>(deserializer: D) -> Result<Vec<Filter>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        filter_list(deserializer)
+    }
 }
 
 mod ser {
     use super::*;
 
-    pub fn pass_environment<S>(filters: &Vec<Filter>, serializer: S) -> Result<S::Ok, S::Error>
+    fn filter_list<S>(filters: &[Filter], serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
@@ -120,6 +138,20 @@ mod ser {
             serializer.serialize_element(&filter.to_string())?;
         }
         serializer.end()
+    }
+
+    pub fn pass_environment<S>(filters: &Vec<Filter>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        filter_list(filters, serializer)
+    }
+
+    pub fn match_environment<S>(filters: &Vec<Filter>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        filter_list(filters, serializer)
     }
 }
 
@@ -131,7 +163,7 @@ pub enum Address {
     Unix(PathBuf),
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct Filter {
     pub negative: bool,
     pub pattern: Pattern,
@@ -172,6 +204,11 @@ pub struct Config {
     #[serde(deserialize_with = "de::pass_environment")]
     #[serde(serialize_with = "ser::pass_environment")]
     pub pass_environment: Vec<Filter>,
+
+    #[serde(default = "default::match_environment")]
+    #[serde(deserialize_with = "de::match_environment")]
+    #[serde(serialize_with = "ser::match_environment")]
+    pub match_environment: Vec<Filter>,
 }
 
 #[cfg(test)]
@@ -198,6 +235,7 @@ impl Default for Config {
             connect: default::connect(),
             log_filters: default::log_filters(),
             pass_environment: default::pass_environment(),
+            match_environment: default::match_environment(),
         }
     }
 }

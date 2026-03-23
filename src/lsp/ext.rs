@@ -177,6 +177,8 @@ pub struct Instance {
     pub server: String,
     pub args: Vec<String>,
     pub env: BTreeMap<String, String>,
+    #[serde(default)]
+    pub match_env: BTreeMap<String, String>,
     pub workspace_root: WorkspaceRoot,
     pub registered_dyn_capabilities: Vec<String>,
     pub idle_for: i64,
