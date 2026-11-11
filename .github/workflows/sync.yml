@@ -1,0 +1,118 @@
+name: Sync Codeberg upstream
+on:
+  schedule:
+    - cron: '23 9 * * *'
+  workflow_dispatch:
+permissions:
+  contents: write
+  issues: write
+concurrency:
+  group: upstream-sync
+  cancel-in-progress: false
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: justin
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch upstream and detect changes
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! timeout 120 git fetch --no-tags https://codeberg.org/p2502/lspmux.git main; then
+            echo 'Codeberg unavailable; skipping without changing any remote branch.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          upstream=$(git rev-parse FETCH_HEAD)
+          original=$(git rev-parse HEAD)
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+          echo "original=$original" >> "$GITHUB_OUTPUT"
+          if git merge-base --is-ancestor "$upstream" HEAD; then
+            echo "No-op: justin ($original) already contains upstream ($upstream)." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+          echo 'changed=true' >> "$GITHUB_OUTPUT"
+      - uses: nixbuild/nix-quick-install-action@2c9db80fb984ceb1bcaa77cdda3fdf8cfba92035
+        if: steps.upstream.outputs.changed == 'true'
+        with:
+          nix_conf: |
+            experimental-features = nix-command flakes
+            connect-timeout = 5
+      - name: Rebase and evaluate
+        if: steps.upstream.outputs.changed == 'true'
+        id: candidate
+        env:
+          UPSTREAM: ${{ steps.upstream.outputs.upstream }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          if ! git rebase "$UPSTREAM" > "$RUNNER_TEMP/rebase.log" 2>&1; then
+            git diff --name-only --diff-filter=U > "$RUNNER_TEMP/conflicts.txt"
+            # Retain the conflicted worktree as a reviewable, deliberately broken snapshot.
+            git rebase --quit
+            git add -u
+            git -c core.hooksPath=/dev/null commit --allow-empty -m 'chore: preserve failed upstream rebase attempt'
+            echo 'failure=Rebase conflict' >> "$GITHUB_OUTPUT"
+          elif ! timeout 300 nix eval --raw --no-write-lock-file --option allow-import-from-derivation false .#packages.x86_64-linux.default.drvPath > "$RUNNER_TEMP/eval.log" 2>&1; then
+            echo 'failure=Package evaluation failed' >> "$GITHUB_OUTPUT"
+          else
+            echo 'valid=true' >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish validated candidate or report failed attempt
+        if: steps.upstream.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          ORIGINAL: ${{ steps.upstream.outputs.original }}
+          UPSTREAM: ${{ steps.upstream.outputs.upstream }}
+          VALID: ${{ steps.candidate.outputs.valid }}
+          FAILURE: ${{ steps.candidate.outputs.failure }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          auth=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 -w0)
+          echo "::add-mask::$auth"
+          push() {
+            git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $auth" push origin "$@"
+          }
+          if [[ "$VALID" == true ]]; then
+            if push --force-with-lease="refs/heads/justin:$ORIGINAL" HEAD:refs/heads/justin; then
+              push "$UPSTREAM:refs/heads/upstream-main"
+              echo "Published validated justin: $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+              exit 0
+            fi
+            FAILURE='Publication rejected; justin was not overwritten'
+          fi
+          attempt="sync-attempt/$(date -u +%F)-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          push "HEAD:refs/heads/$attempt"
+          body="$RUNNER_TEMP/issue.md"
+          {
+            printf '%s\n\n' "$FAILURE"
+            printf 'Original fork: %s\n\nUpstream main: %s\n\n' "$ORIGINAL" "$UPSTREAM"
+            printf 'Attempt: https://github.com/%s/tree/%s\n\n' "$GH_REPO" "$attempt"
+            printf 'Run: https://github.com/%s/actions/runs/%s\n\n' "$GH_REPO" "$GITHUB_RUN_ID"
+            echo 'The attempt may contain conflict markers or fail evaluation. Resolve and validate manually before updating justin.'
+            for log in conflicts.txt rebase.log eval.log; do
+              if [[ -f "$RUNNER_TEMP/$log" ]]; then
+                printf '\n%s\n~~~text\n' "$log"
+                tail -c 8000 "$RUNNER_TEMP/$log"
+                printf '\n~~~\n'
+              fi
+            done
+          } > "$body"
+          title='Upstream sync needs Justin'
+          issue=$(gh issue list --state open --limit 100 --json number,title --jq '.[] | select(.title == "Upstream sync needs Justin") | .number' | head -n 1)
+          if [[ -n "$issue" ]]; then
+            gh issue comment "$issue" --body-file "$body"
+          else
+            gh issue create --title "$title" --body-file "$body"
+          fi
+          cat "$body" >> "$GITHUB_STEP_SUMMARY"
+          exit 1
