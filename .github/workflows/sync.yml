@@ -111,8 +111,9 @@ jobs:
           issue=$(gh issue list --state open --limit 100 --json number,title --jq '.[] | select(.title == "Upstream sync needs Justin") | .number' | head -n 1)
           if [[ -n "$issue" ]]; then
             gh issue comment "$issue" --body-file "$body"
+            gh issue edit "$issue" --add-assignee ooojustin
           else
-            gh issue create --title "$title" --body-file "$body"
+            gh issue create --title "$title" --body-file "$body" --assignee ooojustin
           fi
           cat "$body" >> "$GITHUB_STEP_SUMMARY"
           exit 1
